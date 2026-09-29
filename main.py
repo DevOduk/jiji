@@ -9,7 +9,6 @@ import requests
 
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # Initialize the FastAPI app
@@ -21,31 +20,42 @@ app = FastAPI(
 
 # Jiji configuration
 BASE_URL = "https://jiji.co.ke/api_web/v1/listing"
-Jiji_BASE_URL = "https://jiji.co.ke"
+JIJI_BASE_URL = "https://jiji.co.ke"
 
 PAGE_SIZE = 20
-IMAGE_WORKERS = 3
+MAX_PAGES = 20
 
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/154.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
+    "Referer": "https://jiji.co.ke/cars",
+    "Origin": "https://jiji.co.ke",
+}
+
+PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/154.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://jiji.co.ke/cars",
 }
 
 session = requests.Session()
-session.headers.update(headers)
+session.headers.update(API_HEADERS)
 
 
-# Mock database / storage for your scraped cars
+# In-memory storage for scraped cars
 CAR_DATABASE = []
 
 
@@ -70,7 +80,7 @@ def scrape_cars(
     max_price: Optional[int] = None,
     min_year: Optional[int] = None,
     max_year: Optional[int] = None,
-    max_pages: int = 20,
+    max_pages: int = MAX_PAGES,
 ):
     cars = []
 
@@ -109,9 +119,32 @@ def scrape_cars(
                 timeout=20,
             )
 
+            if response.status_code == 429:
+                wait = 3
+
+                print(
+                    f"Jiji rate limited page {page}. "
+                    f"Waiting {wait}s..."
+                )
+
+                time.sleep(wait)
+                continue
+
+            if response.status_code == 403:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Jiji rejected the request with HTTP 403. "
+                        "The Jiji API is blocking this server/IP."
+                    ),
+                )
+
             response.raise_for_status()
 
             data = response.json()
+
+        except HTTPException:
+            raise
 
         except requests.RequestException as error:
             raise HTTPException(
@@ -125,18 +158,35 @@ def scrape_cars(
                 detail="Jiji returned invalid JSON.",
             )
 
-        adverts_list = data.get("adverts_list", {})
-        adverts = adverts_list.get("adverts", [])
+        adverts_list = data.get(
+            "adverts_list",
+            {},
+        )
+
+        adverts = adverts_list.get(
+            "adverts",
+            [],
+        )
 
         if total is None:
-            total = adverts_list.get("count", 0)
+            total = adverts_list.get(
+                "count",
+                0,
+            )
 
-            total_pages = math.ceil(total / PAGE_SIZE)
+            total_pages = math.ceil(
+                total / PAGE_SIZE
+            )
 
             total_pages = min(
                 total_pages,
                 max_pages,
             )
+
+        print(
+            f"Page {page}/{total_pages}: "
+            f"{len(adverts)} vehicles"
+        )
 
         if not adverts:
             break
@@ -161,7 +211,9 @@ def scrape_cars(
                         "price_obj",
                         {},
                     ).get("value"),
-                    "location": car.get("region_item_text"),
+                    "location": car.get(
+                        "region_item_text"
+                    ),
                     "price_display": car.get(
                         "price_obj",
                         {},
@@ -171,7 +223,9 @@ def scrape_cars(
                         {},
                     ).get("url"),
                     "images": [],
-                    "images_count": car.get("images_count"),
+                    "images_count": car.get(
+                        "images_count"
+                    ),
                     "url": car.get("url"),
                     "attributes": attributes,
                 }
@@ -194,20 +248,19 @@ def get_product_images(url: str):
         return []
 
     product_url = urljoin(
-        Jiji_BASE_URL,
+        JIJI_BASE_URL,
         url,
     )
 
     for attempt in range(4):
         try:
-            # Random delay helps avoid hammering the site
             time.sleep(
                 random.uniform(0.5, 1.5)
             )
 
             response = requests.get(
                 product_url,
-                headers=headers,
+                headers=PAGE_HEADERS,
                 timeout=15,
             )
 
@@ -227,16 +280,14 @@ def get_product_images(url: str):
                     f"Status {response.status_code} "
                     f"for {product_url}"
                 )
-
                 continue
 
             html_text = response.text
-
             images = []
 
-            # Strategy 1: Search raw HTML / Nuxt payload
+            # Search the raw HTML / Nuxt payload
             pattern = (
-                r'https://pictures-kenya\.jijistatic\.com/'
+                r"https://pictures-kenya\.jijistatic\.com/"
                 r'[^\s"\'<>]+'
             )
 
@@ -260,9 +311,10 @@ def get_product_images(url: str):
                 if (
                     src not in images
                     and (
-                        "_" in src
-                        or "webp" in src
-                        or "jpg" in src
+                        ".webp" in src
+                        or ".jpg" in src
+                        or ".jpeg" in src
+                        or ".png" in src
                     )
                 ):
                     images.append(src)
@@ -270,14 +322,16 @@ def get_product_images(url: str):
             if images:
                 return images
 
-            # Strategy 2: BeautifulSoup carousel
+            # BeautifulSoup fallback
             soup = BeautifulSoup(
                 html_text,
                 "html.parser",
             )
 
             carousel = (
-                soup.select_one(".VueCarousel-inner")
+                soup.select_one(
+                    ".VueCarousel-inner"
+                )
                 or soup.select_one(
                     ".b-slider-image__wrapper"
                 )
@@ -297,7 +351,7 @@ def get_product_images(url: str):
                     ):
                         images.append(src)
 
-            # Strategy 3: All Jiji images
+            # Final fallback
             if not images:
                 for img in soup.find_all("img"):
                     src = (
@@ -311,8 +365,8 @@ def get_product_images(url: str):
                         and src not in images
                     ):
                         if (
-                            "avatar" not in src
-                            and "icon" not in src
+                            "avatar" not in src.lower()
+                            and "icon" not in src.lower()
                         ):
                             images.append(src)
 
@@ -334,14 +388,13 @@ def get_product_images(url: str):
             print(
                 f"Image scraping error: {error}"
             )
-
             return []
 
     return []
 
 
 # ---------------------------------------------------------------------------
-# Home / listing endpoint
+# Cars endpoint
 # ---------------------------------------------------------------------------
 
 @app.get(
@@ -361,23 +414,28 @@ def get_cars(
     """
     Scrapes Jiji listing metadata.
 
-    The listing endpoint does NOT scrape individual product pages.
-    This keeps the home page relatively fast.
+    Individual product pages are not scraped here.
     """
 
-    if min_price is not None and max_price is not None:
-        if min_price > max_price:
-            raise HTTPException(
-                status_code=400,
-                detail="min_price cannot be greater than max_price",
-            )
+    if (
+        min_price is not None
+        and max_price is not None
+        and min_price > max_price
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="min_price cannot be greater than max_price",
+        )
 
-    if min_year is not None and max_year is not None:
-        if min_year > max_year:
-            raise HTTPException(
-                status_code=400,
-                detail="min_year cannot be greater than max_year",
-            )
+    if (
+        min_year is not None
+        and max_year is not None
+        and min_year > max_year
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="min_year cannot be greater than max_year",
+        )
 
     cars = scrape_cars(
         make=make,
@@ -389,7 +447,6 @@ def get_cars(
         max_pages=max_pages,
     )
 
-    # Update the in-memory database
     CAR_DATABASE.clear()
     CAR_DATABASE.extend(cars)
 
@@ -409,10 +466,6 @@ def get_car_images(
 ):
     """
     Scrapes images from an individual Jiji product page.
-
-    Example:
-
-    /api/car/images?url=/parklands-highridge/cars/nissan-note-2015.html
     """
 
     if not url:
@@ -421,10 +474,8 @@ def get_car_images(
             detail="URL parameter is required",
         )
 
-    # Decode URL safely
     decoded_url = urllib.parse.unquote(url)
 
-    # Scrape the product page
     images = get_product_images(
         decoded_url
     )
